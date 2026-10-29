@@ -1,0 +1,691 @@
+from __future__ import annotations
+
+import io
+import json
+import re
+import zipfile
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import streamlit as st
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+
+APP_DIR = Path(__file__).resolve().parent
+MASTER_DIR = APP_DIR / "saved_masters"
+MASTER_DIR.mkdir(parents=True, exist_ok=True)
+
+ROLE_LABELS = {
+    "sales": "Sales Order Report (required each day)",
+    "catalog": "Globus Cataloging",
+    "item": "Item Master",
+    "channel": "Channel Master",
+    "season": "Season Change Bucket with Vendor Cost",
+    "week": "Week Master",
+    "myntra": "Myntra MTD Sales Report (optional)",
+}
+REQUIRED_MASTER_ROLES = ["catalog", "item", "channel", "season", "week"]
+ROLE_FILENAMES = {
+    "catalog": "catalog_master",
+    "item": "item_master",
+    "channel": "channel_master",
+    "season": "season_bucket",
+    "week": "week_master",
+    "myntra": "myntra_mtd_sales",
+}
+
+DSR_HEADERS = [
+    "Source", "Ean_comb", "TTL Vendor Cost", "Channel", "TTL QTY", "TTL ESP",
+    "TTL MRP", "Vendor Cost", "TTL RGM", "Cat 1", "Cat 2", "Cat 3", "Cat 4",
+    "Style Code", "Size", "MRP", "Myntra ID", "Date", "Time", "Hour", "Week", "Location"
+]
+
+
+def norm(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value).strip()
+    if text.casefold() in {"nan", "none", "nat", "#n/a", "n/a"}:
+        return ""
+    # Excel codes occasionally arrive as numbers ending in .0.
+    if re.fullmatch(r"-?\d+\.0", text):
+        text = text[:-2]
+    return text
+
+
+def key(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9]", "", norm(value).upper())
+
+
+def parse_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = norm(value)
+    if not s:
+        return None
+    s = s.replace(",", "").replace("₹", "").replace("INR", "").replace("Rs.", "").strip()
+    s = re.sub(r"[^0-9.\-]", "", s)
+    if s in {"", ".", "-", "-."}:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def parse_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, pd.Timestamp):
+        return None if pd.isna(value) else value.to_pydatetime()
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, time.min)
+    if isinstance(value, (int, float)):
+        v = float(value)
+        if 20000 <= v <= 80000:
+            return datetime(1899, 12, 30) + timedelta(days=v)
+        return None
+    s = norm(value)
+    if not s:
+        return None
+    # Excel serials are sometimes converted to text by CSV exports.
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        try:
+            v = float(s)
+            if 20000 <= v <= 80000:
+                return datetime(1899, 12, 30) + timedelta(days=v)
+        except Exception:
+            pass
+    try:
+        dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
+        if pd.isna(dt):
+            return None
+        return dt.to_pydatetime()
+    except Exception:
+        return None
+
+
+def date_key(value: Any) -> str:
+    dt = parse_datetime(value)
+    return dt.date().isoformat() if dt else ""
+
+
+def read_table(file_name: str, data: bytes, role: str | None = None) -> pd.DataFrame:
+    ext = Path(file_name).suffix.lower()
+    bio = io.BytesIO(data)
+    if ext == ".csv":
+        try:
+            return pd.read_csv(bio, dtype=object, encoding="utf-8-sig", sep=None, engine="python")
+        except UnicodeDecodeError:
+            bio.seek(0)
+            return pd.read_csv(bio, dtype=object, encoding="latin1", sep=None, engine="python")
+    usecols = None
+    # Only read the columns this mapping requires, keeping large master files manageable.
+    if role == "sales":
+        usecols = "A:CU"  # SKU, channel, prices, order date, FX rate, facility and invoice fields
+    elif role == "catalog":
+        usecols = "A:D,M:Q,T:T"  # ICODE, aliases, style, size, categories and Style ID
+    elif role == "item":
+        usecols = "D:E"  # New Style and Vendor Cost fallback
+    elif role == "channel":
+        usecols = "A:C"
+    elif role == "week":
+        usecols = "A:O"  # Date in J and Week in O per instructions
+    if ext in {".xlsx", ".xlsm"}:
+        return pd.read_excel(bio, sheet_name=0, dtype=object, engine="openpyxl", usecols=usecols)
+    if ext == ".xls":
+        return pd.read_excel(bio, sheet_name=0, dtype=object, engine="xlrd", usecols=usecols)
+    raise ValueError(f"Unsupported file type for {file_name}. Use XLSX, XLSM, XLS or CSV.")
+
+
+def guess_role(filename: str) -> str | None:
+    name = filename.lower().replace("_", " ").replace("-", " ")
+    if "item master" in name:
+        return "item"
+    if "channel master" in name:
+        return "channel"
+    if "week master" in name:
+        return "week"
+    if "season" in name and ("bucket" in name or "vendor cost" in name or "cost" in name):
+        return "season"
+    if "catalog" in name or "cataloging" in name or "catalogue" in name:
+        return "catalog"
+    if "myntra" in name and ("mtd" in name or "sales report" in name):
+        return "myntra"
+    if "sales order" in name or "order details" in name or "unicommerce" in name or "sales order report" in name:
+        return "sales"
+    return None
+
+
+def find_col(df: pd.DataFrame, aliases: list[str], fallback_idx: int | None = None) -> Any | None:
+    normalized = {key(c): c for c in df.columns}
+    alias_keys = [key(a) for a in aliases]
+    for a in alias_keys:
+        if a in normalized:
+            return normalized[a]
+    # Safe partial match for long headers such as "Order Date as dd/mm/yyyy hh:mm:ss".
+    for a in alias_keys:
+        if len(a) >= 4:
+            for kn, original in normalized.items():
+                if a in kn or kn in a:
+                    return original
+    if fallback_idx is not None and 0 <= fallback_idx < len(df.columns):
+        return df.columns[fallback_idx]
+    return None
+
+
+def series_by(df: pd.DataFrame, aliases: list[str], fallback_idx: int | None = None, default: Any = None) -> pd.Series:
+    col = find_col(df, aliases, fallback_idx)
+    if col is None:
+        return pd.Series([default] * len(df), index=df.index, dtype=object)
+    return df[col]
+
+
+def first_nonblank(*values: Any) -> str:
+    for v in values:
+        text = norm(v)
+        if text:
+            return text
+    return ""
+
+
+def choose_cost_columns(df: pd.DataFrame) -> tuple[Any | None, Any | None]:
+    style_aliases = ["style code", "new style", "stylecode", "new style code", "style", "style id", "newstyle"]
+    cost_aliases = ["vendor cost", "vendorcost", "vc", "cost", "vendor cost rs", "unit cost"]
+    style_col = find_col(df, style_aliases)
+    cost_col = find_col(df, cost_aliases)
+    if style_col is None and len(df.columns) >= 1:
+        style_col = df.columns[0]
+    if cost_col is None and len(df.columns) >= 2:
+        # Prefer an explicitly cost-looking column before falling back to column B.
+        costish = [c for c in df.columns if any(x in key(c) for x in ["cost", "vendorcost", "vc"])]
+        cost_col = costish[0] if costish else df.columns[1]
+    return style_col, cost_col
+
+
+def build_catalog_lookup(catalog: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    cols = {
+        "icode": find_col(catalog, ["icode", "ean_comb", "ean comb", "gs code", "gscode"], 0),
+        "oldsku": find_col(catalog, ["old sku", "oldsku"], 1),
+        "newsku": find_col(catalog, ["new sku", "newsku"], 2),
+        "style": find_col(catalog, ["new style"], 3),
+        "size": find_col(catalog, ["size"], 12),
+        "cat1": find_col(catalog, ["c1", "cat 1", "cat1"], 13),
+        "cat2": find_col(catalog, ["c2", "cat 2", "cat2"], 14),
+        "cat3": find_col(catalog, ["c3", "cat 3", "cat3"], 15),
+        "cat4": find_col(catalog, ["c4", "cat 4", "cat4"], 16),
+        "myntra": find_col(catalog, ["style id", "myntra id", "myntra style id"], 19),
+        "season": find_col(catalog, ["business season", "season"], 9),
+    }
+    lookup: dict[str, dict[str, Any]] = {}
+    # Catalog instructions say search ICODE, OLD SKU and New SKU, but output the ICODE.
+    for _, row in catalog.iterrows():
+        data = {name: (row[col] if col in catalog.columns else None) for name, col in cols.items()}
+        canonical = norm(data["icode"])
+        if not canonical:
+            continue
+        for alias_field in ("icode", "oldsku", "newsku"):
+            alias = key(data[alias_field])
+            if alias and alias not in lookup:
+                lookup[alias] = data
+    return lookup
+
+
+def build_cost_map(df: pd.DataFrame, style_aliases: list[str], cost_aliases: list[str], fallback_style: int | None = None, fallback_cost: int | None = None) -> dict[str, float]:
+    style_col = find_col(df, style_aliases, fallback_style)
+    cost_col = find_col(df, cost_aliases, fallback_cost)
+    result: dict[str, float] = {}
+    if style_col is None or cost_col is None:
+        return result
+    for _, row in df[[style_col, cost_col]].iterrows():
+        style = key(row[style_col])
+        cost = parse_number(row[cost_col])
+        if style and cost is not None:
+            result[style] = cost
+    return result
+
+
+def build_channel_maps(df: pd.DataFrame) -> tuple[dict[str, str], dict[str, str]]:
+    source_col = find_col(df, ["channel"], 0)
+    clean_col = find_col(df, ["channel clean", "channel clean name", "clean channel"], 1)
+    business_col = find_col(df, ["bussiness type", "business type", "business type"], 2)
+    channel_map: dict[str, str] = {}
+    business_map: dict[str, str] = {}
+    if source_col is None or clean_col is None:
+        return channel_map, business_map
+    for _, row in df.iterrows():
+        source = key(row[source_col])
+        clean = norm(row[clean_col])
+        if source and clean:
+            channel_map[source] = clean
+            if business_col is not None:
+                business_map[source] = norm(row[business_col])
+    return channel_map, business_map
+
+
+def infer_channel(raw: Any) -> str:
+    s = norm(raw).upper()
+    tests = [
+        ("AJIO", "AJIO"), ("FLIPKART", "Flipkart"), ("COCOBLU", "COCOBLU"),
+        ("MYNTRA", "Myntra"), ("NAMSHI_B2B2C", "NAMSHI_B2B2C"), ("NAMSHI B2B2C", "NAMSHI_B2B2C"),
+        ("NAMSHI", "NAMSHI"), ("NOON", "NOON"), ("STYLI", "STYLI"),
+        ("NYKAA", "Nykaa"), ("TATACLIQ", "Tata Cliq"), ("TATA CLIQ", "Tata Cliq"),
+        ("AMAZON", "Amazon"), ("MEESHO", "Meesho"), ("LIMEROAD", "LimeRoad"),
+        ("SHOPIFY", "Globus"), ("GLOBUS", "Globus"), ("FYND", "Fynd"), ("JIO", "Jio Mart"),
+        ("SNAPDEAL", "Snapdeal"),
+    ]
+    for token, label in tests:
+        if token in s:
+            return label
+    return ""
+
+
+def make_excel(dsr_rows: list[list[Any]], issue_rows: list[list[Any]], summary_rows: list[list[Any]], upload_rows: list[list[Any]]) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "DSR"
+    ws.append(DSR_HEADERS)
+    for row in dsr_rows:
+        ws.append(row)
+
+    checks = wb.create_sheet("Mapping Check")
+    check_headers = ["Sales Row", "Raw Item SKU", "Raw Channel", "Ean_comb", "Style Code", "Order Date", "Location", "Issue"]
+    checks.append(check_headers)
+    for row in issue_rows:
+        checks.append(row)
+
+    summary = wb.create_sheet("Run Summary")
+    summary.append(["Metric", "Value"])
+    for row in summary_rows:
+        summary.append(row)
+
+    uploads = wb.create_sheet("Files Used")
+    uploads.append(["Role", "File", "Rows", "Notes"])
+    for row in upload_rows:
+        uploads.append(row)
+
+    header_fill = PatternFill("solid", fgColor="17365D")
+    header_font = Font(bold=True, color="FFFFFF")
+    thin_gray = Side(style="thin", color="D9E2F3")
+    for sheet in wb.worksheets:
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions if sheet.max_row > 1 else "A1:A1"
+        for cell in sheet[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = Border(bottom=thin_gray)
+        sheet.row_dimensions[1].height = 30
+        for col_cells in sheet.columns:
+            letter = get_column_letter(col_cells[0].column)
+            max_len = 0
+            for cell in list(col_cells)[:2000]:
+                v = cell.value
+                max_len = max(max_len, len(str(v)) if v is not None else 0)
+            sheet.column_dimensions[letter].width = min(max(max_len + 2, 11), 32)
+        for row in sheet.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(vertical="top")
+    # More readable DSR widths and date/time/currency formats.
+    dsr_widths = {1: 16, 2: 15, 3: 17, 4: 16, 5: 11, 6: 14, 7: 14, 8: 14, 9: 14,
+                  10: 18, 11: 18, 12: 20, 13: 20, 14: 22, 15: 12, 16: 14, 17: 16,
+                  18: 13, 19: 13, 20: 10, 21: 15, 22: 24}
+    for col, width in dsr_widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = width
+    for row in ws.iter_rows(min_row=2, min_col=3, max_col=9):
+        for cell in row:
+            if cell.column in (3, 6, 7, 8, 9):
+                cell.number_format = '#,##0.00;[Red]-#,##0.00;–'
+    for row in ws.iter_rows(min_row=2):
+        row[17].number_format = "dd-mmm-yyyy"  # Date (R)
+        row[18].number_format = "hh:mm:ss"     # Time (S)
+    # Shade issues for quick scanning.
+    for row in checks.iter_rows(min_row=2):
+        if row[7].value:
+            row[7].fill = PatternFill("solid", fgColor="FCE4D6")
+    stream = io.BytesIO()
+    wb.save(stream)
+    return stream.getvalue()
+
+
+def process_files(role_files: dict[str, tuple[str, bytes]]) -> tuple[bytes, dict[str, Any]]:
+    needed = ["sales"] + REQUIRED_MASTER_ROLES
+    missing = [r for r in needed if r not in role_files]
+    if missing:
+        labels = ", ".join(ROLE_LABELS[r] for r in missing)
+        raise ValueError("Missing required file(s): " + labels)
+
+    # Myntra MTD Sales is accepted and remembered, but current requested DSR maps Myntra ID from Cataloging.
+    tables = {role: read_table(name, data, role) for role, (name, data) in role_files.items() if role != "myntra"}
+    raw = tables["sales"].copy()
+    catalog = tables["catalog"]
+    item = tables["item"]
+    channels = tables["channel"]
+    season = tables["season"]
+    week = tables["week"]
+
+    # UniCommerce fixed columns, with header-based lookup preferred.
+    raw_sku = series_by(raw, ["Item SKU Code", "Item SKU", "SKU Code"], 38)
+    raw_channel = series_by(raw, ["Channel Name", "Channel"], 44)
+    raw_mrp = series_by(raw, ["MRP"], 49)
+    raw_price = series_by(raw, ["Selling Price", "SellingPrice"], 51)
+    raw_order_date = series_by(raw, ["Order Date as dd/mm/yyyy hh:mm:ss", "Order Date", "Created Date"], 76)
+    raw_fx = series_by(raw, ["Currency Conversion Rate", "Currency Conversion"], 82, default=1)
+    raw_location = series_by(raw, ["Facility", "Location", "Warehouse"], 98)
+    raw_invoice = series_by(raw, ["Invoice Code"], 11)
+
+    catalog_lookup = build_catalog_lookup(catalog)
+    # Vendor costs: current season/month bucket first, Item Master fallback second.
+    season_style_col, season_cost_col = choose_cost_columns(season)
+    if season_style_col is None or season_cost_col is None:
+        season_costs = {}
+    else:
+        season_costs = build_cost_map(season, [str(season_style_col)], [str(season_cost_col)])
+    item_costs = build_cost_map(item, ["new style", "style code", "new style code", "style"], ["vendor cost", "vendorcost", "vc"], 3, 4)
+    channel_map, _business_map = build_channel_maps(channels)
+
+    wk_date_col = find_col(week, ["date", "week date", "calendar date"], 9)
+    wk_value_col = find_col(week, ["week", "week number", "week no", "week label"], 14)
+    week_map: dict[str, str] = {}
+    if wk_date_col is not None and wk_value_col is not None:
+        for _, wr in week[[wk_date_col, wk_value_col]].iterrows():
+            dk = date_key(wr[wk_date_col])
+            wv = norm(wr[wk_value_col])
+            if dk and wv:
+                week_map[dk] = wv
+
+    # Prepare catalog and output rows in one pass.
+    dsr_rows: list[list[Any]] = []
+    issue_rows: list[list[Any]] = []
+    count = {
+        "rows": 0, "catalog_mapped": 0, "vendor_cost_season": 0, "vendor_cost_item_fallback": 0,
+        "vendor_cost_missing": 0, "channel_exact": 0, "channel_inferred": 0,
+        "channel_missing": 0, "week_mapped": 0, "week_missing": 0, "date_missing": 0,
+        "invoice_yes": 0,
+    }
+
+    for idx in raw.index:
+        sku = raw_sku.loc[idx] if idx in raw_sku.index else None
+        channel_raw = raw_channel.loc[idx] if idx in raw_channel.index else None
+        sku_key = key(sku)
+        cat = catalog_lookup.get(sku_key, {}) if sku_key else {}
+        if cat and norm(cat.get("icode")):
+            count["catalog_mapped"] += 1
+        ean = norm(cat.get("icode"))
+        style = norm(cat.get("style"))
+        size = norm(cat.get("size"))
+        cat1 = norm(cat.get("cat1")); cat2 = norm(cat.get("cat2")); cat3 = norm(cat.get("cat3")); cat4 = norm(cat.get("cat4"))
+        myntra_id = norm(cat.get("myntra"))
+        raw_channel_key = key(channel_raw)
+        channel = channel_map.get(raw_channel_key, "") if raw_channel_key else ""
+        channel_status = ""
+        if channel:
+            count["channel_exact"] += 1
+            channel_status = ""
+        else:
+            inferred = infer_channel(channel_raw)
+            if inferred:
+                channel = inferred
+                count["channel_inferred"] += 1
+                channel_status = "Channel missing in Channel Master; channel inferred from source name"
+            else:
+                channel = norm(channel_raw)
+                if channel:
+                    count["channel_missing"] += 1
+                    channel_status = "Channel missing in Channel Master"
+
+        vc = None
+        style_key = key(style)
+        if style_key and style_key in season_costs:
+            vc = season_costs[style_key]
+            count["vendor_cost_season"] += 1
+        elif style_key and style_key in item_costs:
+            vc = item_costs[style_key]
+            count["vendor_cost_item_fallback"] += 1
+        else:
+            count["vendor_cost_missing"] += 1
+
+        qty = 1
+        mrp = parse_number(raw_mrp.loc[idx]) if idx in raw_mrp.index else None
+        price = parse_number(raw_price.loc[idx]) if idx in raw_price.index else None
+        fx = parse_number(raw_fx.loc[idx]) if idx in raw_fx.index else 1
+        fx = 1 if fx is None or fx == 0 else fx
+        channel_cmp = key(channel)
+        if channel_cmp in {"AJIO", "FLIPKART", "COCOBLU", "MYNTRA"}:
+            ttl_esp = price
+        elif channel_cmp in {"NOON", "NAMSHI", "NAMSHIB2B2C"}:
+            ttl_esp = price * fx if price is not None else None
+        else:
+            ttl_esp = price * qty if price is not None else None
+        ttl_mrp = mrp * qty if mrp is not None else None
+        ttl_vc = vc * qty if vc is not None else None
+        ttl_rgm = ttl_esp - ttl_vc if ttl_esp is not None and ttl_vc is not None else None
+
+        dt = parse_datetime(raw_order_date.loc[idx]) if idx in raw_order_date.index else None
+        if dt is None:
+            count["date_missing"] += 1
+        day_key = dt.date().isoformat() if dt else ""
+        wk = week_map.get(day_key, "") if day_key else ""
+        if wk:
+            count["week_mapped"] += 1
+        else:
+            count["week_missing"] += 1
+
+        location = norm(raw_location.loc[idx]) if idx in raw_location.index else ""
+        invoice = norm(raw_invoice.loc[idx]) if idx in raw_invoice.index else ""
+        if invoice:
+            count["invoice_yes"] += 1
+
+        row = [
+            "UNICOMMERCE", ean, ttl_vc, channel, qty, ttl_esp, ttl_mrp, vc, ttl_rgm,
+            cat1, cat2, cat3, cat4, style, size, mrp, myntra_id,
+            dt.date() if dt else None, dt.time().replace(microsecond=0) if dt else None,
+            dt.hour if dt else None, wk, location
+        ]
+        dsr_rows.append(row)
+        count["rows"] += 1
+
+        issues = []
+        if not ean:
+            issues.append("Catalog mapping missing")
+        if vc is None:
+            issues.append("Vendor Cost missing (season bucket and Item Master fallback)")
+        if channel_status:
+            issues.append(channel_status)
+        if not dt:
+            issues.append("Order Date could not be parsed")
+        elif not wk:
+            issues.append("Week Master mapping missing for date")
+        if issues:
+            issue_rows.append([idx + 2, norm(sku), norm(channel_raw), ean, style, dt.date() if dt else norm(raw_order_date.loc[idx]), location, "; ".join(issues)])
+
+    summary_rows = [
+        ["Sales lines processed", count["rows"]],
+        ["Catalog/EAN mapped", count["catalog_mapped"]],
+        ["Catalog/EAN missing", count["rows"] - count["catalog_mapped"]],
+        ["Vendor Cost from Season Change Bucket", count["vendor_cost_season"]],
+        ["Vendor Cost from Item Master fallback", count["vendor_cost_item_fallback"]],
+        ["Vendor Cost missing", count["vendor_cost_missing"]],
+        ["Channel mapped exactly from Channel Master", count["channel_exact"]],
+        ["Channel inferred from source name (review master)", count["channel_inferred"]],
+        ["Channel still unmapped", count["channel_missing"]],
+        ["Week mapped", count["week_mapped"]],
+        ["Week missing", count["week_missing"]],
+        ["Date not parsed", count["date_missing"]],
+        ["Raw rows with Invoice Code populated", count["invoice_yes"]],
+        ["TTL QTY rule", "1 per sales-order item row, per supplied mapping instructions"],
+        ["TTL ESP rule", "Channel-specific rules from supplied mapping instructions; currency conversion used for NOON/NAMSHI"],
+        ["Vendor Cost precedence", "Season Change Bucket first; Item Master fallback second"],
+        ["Note", "Missing mappings are shown in Mapping Check and are not silently guessed."],
+    ]
+    upload_rows = []
+    role_note = {
+        "sales": "Raw order data; first worksheet read",
+        "catalog": "Used for ICODE/EAN, Style, Size, Categories and Myntra ID",
+        "item": "Fallback Vendor Cost by style code",
+        "channel": "Channel clean-name mapping",
+        "season": "Preferred/current Vendor Cost mapping",
+        "week": "Date-to-Week mapping",
+        "myntra": "Uploaded and saved for future use; current 22-column mapping takes Myntra ID from Cataloging",
+    }
+    for role, (filename, _data) in role_files.items():
+        rows_used = len(tables[role]) if role in tables else "Not read by current DSR rules"
+        upload_rows.append([ROLE_LABELS.get(role, role), filename, rows_used, role_note.get(role, "")])
+
+    excel_bytes = make_excel(dsr_rows, issue_rows, summary_rows, upload_rows)
+    metadata = {**count, "issues": len(issue_rows), "dsr_rows": len(dsr_rows), "mapping_check_rows": len(issue_rows)}
+    return excel_bytes, metadata
+
+
+def read_saved_masters() -> dict[str, tuple[str, bytes]]:
+    saved: dict[str, tuple[str, bytes]] = {}
+    for role in REQUIRED_MASTER_ROLES + ["myntra"]:
+        path = MASTER_DIR / f"{ROLE_FILENAMES[role]}.xlsx"
+        # Season master may be csv and is stored preserving extension.
+        candidates = list(MASTER_DIR.glob(f"{ROLE_FILENAMES[role]}.*"))
+        candidates = [p for p in candidates if p.is_file()]
+        if candidates:
+            p = max(candidates, key=lambda x: x.stat().st_mtime)
+            saved[role] = (p.name, p.read_bytes())
+    return saved
+
+
+def save_master(role: str, filename: str, data: bytes) -> str:
+    ext = Path(filename).suffix.lower() or ".xlsx"
+    for old in MASTER_DIR.glob(f"{ROLE_FILENAMES[role]}.*"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    destination = MASTER_DIR / f"{ROLE_FILENAMES[role]}{ext}"
+    destination.write_bytes(data)
+    return destination.name
+
+
+def main() -> None:
+    st.set_page_config(page_title="Globus DSR Automation", page_icon="📊", layout="wide")
+    st.title("Globus Daily Sales Report Automation")
+    st.caption("Upload all files together the first time. Master files are saved locally so future days usually need only the new Sales Order Report.")
+
+    saved_masters = read_saved_masters()
+    with st.container(border=True):
+        st.subheader("1. Upload files")
+        uploads = st.file_uploader(
+            "Drag and drop all files here (XLSX, XLSM, XLS, CSV). File names are auto-detected.",
+            type=["xlsx", "xlsm", "xls", "csv"],
+            accept_multiple_files=True,
+            help="First run: upload Sales Order Report + Item Master + Channel Master + Globus Cataloging + Season Change Bucket + Week Master. Myntra MTD report is optional. Next runs: upload the new Sales Order Report; saved master files will be reused.",
+        )
+        if saved_masters:
+            st.success(
+                "Saved master files found locally: "
+                + ", ".join(ROLE_LABELS[r].split(" (")[0] for r in saved_masters)
+                + ". They will be reused unless you upload replacements."
+            )
+        else:
+            st.info("First-time setup: upload the sales report and all five required master files. They can be saved for future daily runs.")
+
+    role_overrides: dict[str, str | None] = {}
+    if uploads:
+        with st.expander("2. Confirm file matching (normally automatic)", expanded=False):
+            st.caption("Check the detected role for each file. Change it only if the filename was not recognized correctly.")
+            choices = ["Auto-detect / ignore", *ROLE_LABELS.keys()]
+            for i, up in enumerate(uploads):
+                guessed = guess_role(up.name)
+                options = ["Auto-detect / ignore", "sales", "catalog", "item", "channel", "season", "week", "myntra"]
+                if guessed in options:
+                    default_index = options.index(guessed)
+                else:
+                    default_index = 0
+                choice = st.selectbox(
+                    f"{up.name}", options=options, index=default_index,
+                    format_func=lambda x: "Auto-detect / ignore" if x == options[0] else ROLE_LABELS[x],
+                    key=f"role_{i}_{up.name}",
+                )
+                role_overrides[up.name] = guessed if choice == "Auto-detect / ignore" else choice
+
+    uploaded_role_files: dict[str, tuple[str, bytes]] = {}
+    duplicates: list[str] = []
+    for up in (uploads or []):
+        role = role_overrides.get(up.name, guess_role(up.name))
+        if role is None:
+            continue
+        if role in uploaded_role_files:
+            duplicates.append(ROLE_LABELS.get(role, role))
+        uploaded_role_files[role] = (up.name, up.getvalue())
+
+    remember = st.checkbox("Remember uploaded master files on this computer for next time", value=True,
+                           help="Saved masters stay in the tool folder under saved_masters. They are not sent anywhere by this app.")
+
+    st.subheader("3. Generate DSR")
+    if duplicates:
+        st.warning("Multiple uploaded files were assigned to the same role: " + ", ".join(sorted(set(duplicates))) + ". The last matching file will be used; adjust file matching above if needed.")
+
+    if st.button("Generate DSR Excel", type="primary", use_container_width=True):
+        combined = dict(saved_masters)
+        combined.update(uploaded_role_files)
+        # A missing sales report must never fall back to yesterday's report.
+        if "sales" not in uploaded_role_files:
+            st.error("Please upload today's Sales Order Report. A previous sales report is never reused automatically.")
+        else:
+            missing = [r for r in REQUIRED_MASTER_ROLES if r not in combined]
+            if missing:
+                st.error("Required master file(s) not found: " + ", ".join(ROLE_LABELS[r] for r in missing) + ". Upload them once; the tool can save them for future days.")
+            else:
+                try:
+                    with st.spinner("Reading masters, mapping sales lines and calculating DSR..."):
+                        if remember:
+                            for role in REQUIRED_MASTER_ROLES + ["myntra"]:
+                                if role in uploaded_role_files:
+                                    save_master(role, uploaded_role_files[role][0], uploaded_role_files[role][1])
+                        excel_bytes, meta = process_files(combined)
+                    st.success(f"DSR generated: {meta['dsr_rows']:,} sales lines processed.")
+                    k1, k2, k3, k4 = st.columns(4)
+                    k1.metric("Rows processed", f"{meta['rows']:,}")
+                    k2.metric("Catalog matched", f"{meta['catalog_mapped']:,}")
+                    k3.metric("Vendor cost missing", f"{meta['vendor_cost_missing']:,}")
+                    k4.metric("Rows needing review", f"{meta['issues']:,}")
+                    out_name = f"DSR_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+                    st.download_button("Download DSR Excel", data=excel_bytes, file_name=out_name,
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                       type="primary", use_container_width=True)
+                    st.info("Open the downloaded workbook. Review the Mapping Check tab for missing catalog, vendor-cost, channel or week mappings.")
+                except Exception as exc:
+                    st.error(f"Could not generate DSR: {exc}")
+                    st.exception(exc)
+
+    with st.expander("Daily use instructions"):
+        st.markdown("""
+        **First time:** Upload the Sales Order Report, Item Master, Channel Master, Globus Cataloging, Season Change Bucket, and Week Master in the upload box above. Myntra MTD Sales Report is optional. Click **Generate DSR Excel** and download the result.
+
+        **Every next day:** Double-click `run_dsr_tool.bat`, upload only the new Sales Order Report, then click **Generate DSR Excel**. If a master file changes, upload its replacement too. Master files are stored only in the tool folder on this computer.
+
+        **Important:** The tool uses the first worksheet in each uploaded workbook. Keep master column headers and structure consistent with the files used to configure DSR. Any missing mappings appear in the workbook's **Mapping Check** sheet instead of being silently invented.
+        """)
+
+if __name__ == "__main__":
+    main()
